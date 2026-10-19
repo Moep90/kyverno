@@ -3,12 +3,13 @@ package jmespath
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/md5" // #nosec G501
 	"crypto/rsa"
 	"crypto/sha1" // #nosec G505
 	"crypto/sha256"
 	"crypto/x509"
-	"encoding/asn1"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -32,14 +33,25 @@ import (
 	"github.com/kyverno/kyverno/pkg/config"
 	imageutils "github.com/kyverno/kyverno/pkg/utils/image"
 	regen "github.com/zach-klippenstein/goregen"
-	"golang.org/x/crypto/cryptobyte"
-	cryptobyte_asn1 "golang.org/x/crypto/cryptobyte/asn1"
 	"sigs.k8s.io/yaml"
 )
 
+// PublicKey is the encoded form of an RSA public key in x509_decode output.
 type PublicKey struct {
 	N string
 	E int
+}
+
+// ECDSAPublicKey is the encoded form of an ECDSA public key: the curve name
+// and the point in uncompressed SEC 1 form.
+type ECDSAPublicKey struct {
+	Curve string
+	Point []byte
+}
+
+// Ed25519PublicKey is the encoded form of an Ed25519 public key.
+type Ed25519PublicKey struct {
+	Key []byte
 }
 
 // function names
@@ -1195,26 +1207,24 @@ func encode[T any](in T) (any, error) {
 	return res, nil
 }
 
-func jpX509Decode(arguments []any) (any, error) {
-	parseSubjectPublicKeyInfo := func(data []byte) (*rsa.PublicKey, error) {
-		spki := cryptobyte.String(data)
-		if !spki.ReadASN1(&spki, cryptobyte_asn1.SEQUENCE) {
-			return nil, errors.New("writing asn.1 element to 'spki' failed")
-		}
-		var pkAISeq cryptobyte.String
-		if !spki.ReadASN1(&pkAISeq, cryptobyte_asn1.SEQUENCE) {
-			return nil, errors.New("writing asn.1 element to 'pkAISeq' failed")
-		}
-		var spk asn1.BitString
-		if !spki.ReadASN1BitString(&spk) {
-			return nil, errors.New("writing asn.1 bit string to 'spk' failed")
-		}
-		if kk, err := x509.ParsePKCS1PublicKey(spk.Bytes); err != nil {
+func encodePublicKey(key any) (any, error) {
+	switch k := key.(type) {
+	case *rsa.PublicKey:
+		return PublicKey{N: k.N.String(), E: k.E}, nil
+	case *ecdsa.PublicKey:
+		point, err := k.Bytes()
+		if err != nil {
 			return nil, err
-		} else {
-			return kk, nil
 		}
+		return ECDSAPublicKey{Curve: k.Curve.Params().Name, Point: point}, nil
+	case ed25519.PublicKey:
+		return Ed25519PublicKey{Key: k}, nil
+	default:
+		return nil, fmt.Errorf("unsupported public key type %T", key)
 	}
+}
+
+func jpX509Decode(arguments []any) (any, error) {
 	if input, err := validateArg(x509_decode, arguments, 0, reflect.String); err != nil {
 		return nil, err
 	} else if block, _ := pem.Decode([]byte(input.String())); block == nil {
@@ -1225,30 +1235,18 @@ func jpX509Decode(arguments []any) (any, error) {
 			var cert *x509.Certificate
 			if cert, err = x509.ParseCertificate(block.Bytes); err != nil {
 				return nil, err
-			} else if cert.PublicKeyAlgorithm != x509.RSA {
-				return nil, errors.New("certificate should use rsa algorithm")
-			} else if pk, err := parseSubjectPublicKeyInfo(cert.RawSubjectPublicKeyInfo); err != nil {
-				return nil, errors.New("failed to parse subject public key info")
+			} else if cert.PublicKey, err = encodePublicKey(cert.PublicKey); err != nil {
+				return nil, err
 			} else {
-				cert.PublicKey = PublicKey{
-					N: pk.N.String(),
-					E: pk.E,
-				}
 				return encode(cert)
 			}
 		case "CERTIFICATE REQUEST":
 			var csr *x509.CertificateRequest
 			if csr, err = x509.ParseCertificateRequest(block.Bytes); err != nil {
 				return nil, err
-			} else if csr.PublicKeyAlgorithm != x509.RSA {
-				return nil, errors.New("certificate should use rsa algorithm")
-			} else if pk, err := parseSubjectPublicKeyInfo(csr.RawSubjectPublicKeyInfo); err != nil {
-				return nil, errors.New("failed to parse subject public key info")
+			} else if csr.PublicKey, err = encodePublicKey(csr.PublicKey); err != nil {
+				return nil, err
 			} else {
-				csr.PublicKey = PublicKey{
-					N: pk.N.String(),
-					E: pk.E,
-				}
 				return encode(csr)
 			}
 		default:
